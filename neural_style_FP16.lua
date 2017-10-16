@@ -51,7 +51,6 @@ cmd:option('-style_layers', 'relu1_2,relu2_2,relu3_2,relu4_2,relu5_2', 'layers f
 
 local function main(params)
   local dtype, multigpu = setup_gpu(params)
-  print(dtype)
 
   local loadcaffe_backend = params.backend
   if params.backend == 'clnn' then loadcaffe_backend = 'nn' end
@@ -110,7 +109,7 @@ local function main(params)
   local next_content_idx, next_style_idx = 1, 1
   local net = nn.Sequential()
   if params.tv_weight > 0 then
-    local tv_mod = nn.TVLoss(params.tv_weight):type(dtype)
+    local tv_mod = nn.TVLoss(params.tv_weight):cudaHalf() --:type(dtype)
     net:add(tv_mod)
   end
   for i = 1, #cnn do
@@ -123,7 +122,7 @@ local function main(params)
         assert(layer.padW == 0 and layer.padH == 0)
         local kW, kH = layer.kW, layer.kH
         local dW, dH = layer.dW, layer.dH
-        local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH):type(dtype)
+        local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH):cudaHalf()  --:type(dtype)
         local msg = 'Replacing max pooling at layer %d with average pooling'
         print(string.format(msg, i))
         net:add(avg_pool_layer)
@@ -133,7 +132,7 @@ local function main(params)
       if name == content_layers[next_content_idx] then
         print("Setting up content layer", i, ":", layer.name)
         local norm = params.normalize_gradients
-        local loss_module = nn.ContentLoss(params.content_weight, norm):type(dtype)
+        local loss_module = nn.ContentLoss(params.content_weight, norm):cudaHalf()  --:type(dtype)
         net:add(loss_module)
         table.insert(content_losses, loss_module)
         next_content_idx = next_content_idx + 1
@@ -141,7 +140,7 @@ local function main(params)
       if name == style_layers[next_style_idx] then
         print("Setting up style layer  ", i, ":", layer.name)
         local norm = params.normalize_gradients
-        local loss_module = nn.StyleLoss(params.style_weight, norm):type(dtype)
+        local loss_module = nn.StyleLoss(params.style_weight, norm):cudaHalf()  --:type(dtype)
         net:add(loss_module)
         table.insert(style_losses, loss_module)
         next_style_idx = next_style_idx + 1
@@ -151,18 +150,17 @@ local function main(params)
   if multigpu then
     net = setup_multi_gpu(net, params)
   end
-  --net:type(dtype)
-  net:type('torch.CudaHalfTensor')
+  net:cudaHalf()  --:type(dtype)
+  print(net)
+
 
   -- Capture content targets
   for i = 1, #content_losses do
     content_losses[i].mode = 'capture'
   end
   print 'Capturing content targets'
-  print(net)
-  content_image_caffe = content_image_caffe:type(dtype)
-  --net:forward(content_image_caffe:type(dtype))
-  net:forward(content_image_caffe:type('torch.CudaHalfTensor'))
+  content_image_caffe = content_image_caffe:cudaHalf()  --:type(dtype)
+  net:forward(content_image_caffe:cudaHalf())  --:type(dtype))
 
   -- Capture style targets
   for i = 1, #content_losses do
@@ -174,13 +172,15 @@ local function main(params)
       style_losses[j].mode = 'capture'
       style_losses[j].blend_weight = style_blend_weights[i]
     end
-    --net:forward(style_images_caffe[i]:type(dtype))
-    net:forward(style_images_caffe[i]:type('torch.CudaHalfTensor'))
+    net:forward(style_images_caffe[i]:cudaHalf())  --:type(dtype))
   end
 
   -- Set all loss modules to loss mode
   for i = 1, #content_losses do
     content_losses[i].mode = 'loss'
+    --print('Original content loss')
+    --print(content_losses[i].target)
+
   end
   for i = 1, #style_losses do
     style_losses[i].mode = 'loss'
@@ -197,6 +197,8 @@ local function main(params)
     end
   end
   collectgarbage()
+  
+  print('Before the initialization of the target image')
 
   -- Initialize the image
   if params.seed >= 0 then
@@ -209,19 +211,18 @@ local function main(params)
     if init_image then
       img = init_image:clone()
     else
-      img = content_image_caffe:clone()
+      img = content_image_caffe:clone():cudaHalf()  
     end
   else
     error('Invalid init type')
   end
-  --img = img:type(dtype)
-  img = img:type('torch.CudaHalfTensor')
+  img = img:cudaHalf()  --:type(dtype)
 
   -- Run it through the network once to get the proper size for the gradient
   -- All the gradients will come from the extra loss modules, so we just pass
   -- zeros into the top of the net on the backward pass.
   local y = net:forward(img)
-  local dy = img.new(#y):zero()
+  local dy = img.new(#y):zero():cudaHalf()
 
   -- Declaring this here lets us access it in maybe_print
   local optim_state = nil
@@ -238,8 +239,7 @@ local function main(params)
   elseif params.optimizer == 'adam' then
     optim_state = {
       learningRate = params.learning_rate,
-      --increase epsilon. The default 1e-8 is rounded to zero for half precision
-      epsilon = 1e-2,
+      epsilon = 1e-6,
     }
   else
     error(string.format('Unrecognized optimizer "%s"', params.optimizer))
@@ -250,12 +250,12 @@ local function main(params)
     if verbose then
       print(string.format('Iteration %d / %d', t, params.num_iterations))
       for i, loss_module in ipairs(content_losses) do
-        print(string.format('  Content %d loss: %f', i, loss_module.loss:type(float)))
+        print(string.format('  Content %d loss: %f', i, loss_module.loss))
       end
       for i, loss_module in ipairs(style_losses) do
-        print(string.format('  Style %d loss: %f', i, loss_module.loss:type(float)))
+        print(string.format('  Style %d loss: %f', i, loss_module.loss))
       end
-      print(string.format('  Total loss: %f', loss:type(float)))
+      print(string.format('  Total loss: %f', loss))
     end
   end
 
@@ -287,8 +287,20 @@ local function main(params)
   local num_calls = 0
   local function feval(x)
     num_calls = num_calls + 1
+    --print('input (i.e., x image) type:', x:type())
+    --print('print input (i.e., x image)')
+    --print(x)
     net:forward(x)
     local grad = net:updateGradInput(x, dy)
+    --print('The gradient on input at layer 22:')
+    --print(net:get(22).gradInput)
+    --print('The gradient on input at layer 15:')
+    --print(net:get(15).gradInput)
+    --print('The gradient on input at layer 6:')
+    --print(net:get(6).gradInput)
+    --print('grad type:', grad:type())
+    --print('print grad')
+    --print(grad)
     local loss = 0
     for _, mod in ipairs(content_losses) do
       loss = loss + mod.loss
@@ -328,6 +340,7 @@ function setup_gpu(params)
   else
     params.gpu = tonumber(params.gpu) + 1
   end
+  
   --local dtype = 'torch.FloatTensor'
   local dtype = 'torch.HalfTensor'
   if multigpu or params.gpu > 0 then
@@ -339,8 +352,8 @@ function setup_gpu(params)
       else
         cutorch.setDevice(params.gpu)
       end
-      --dtype = 'torch.CudaTensor'
       dtype = 'torch.CudaHalfTensor'
+      dtype = 'torch.CudaTensor'
     else
       require 'clnn'
       require 'cltorch'
@@ -462,16 +475,18 @@ function ContentLoss:__init(strength, normalize)
   parent.__init(self)
   self.strength = strength
   --self.target = torch.Tensor()
-  self.target = torch.HalfTensor()
+  self.target = torch.CudaHalfTensor()
   self.normalize = normalize or false
   self.loss = 0
-  self.crit = nn.MSECriterion()
+  self.crit = nn.SELF_MSECriterion():cuda()
   self.mode = 'none'
 end
 
 function ContentLoss:updateOutput(input)
   if self.mode == 'loss' then
+    --print('Content loss mode:', self.mode)
     self.loss = self.crit:forward(input, self.target) * self.strength
+    --print('Content loss:', self.loss)
   elseif self.mode == 'capture' then
     self.target:resizeAs(input):copy(input)
   end
@@ -482,7 +497,8 @@ end
 function ContentLoss:updateGradInput(input, gradOutput)
   if self.mode == 'loss' then
     if input:nElement() == self.target:nElement() then
-      self.gradInput = self.crit:backward(input, self.target)
+      --local gradInput_l = self.crit:backward(input, self.target)
+      self.gradInput = self.crit:backward(input, self.target) --gradInput_l:clone():cudaHalf()
     end
     if self.normalize then
       self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
@@ -492,6 +508,9 @@ function ContentLoss:updateGradInput(input, gradOutput)
   else
     self.gradInput:resizeAs(gradOutput):copy(gradOutput)
   end
+  --print('The gradient of content layer:')
+  --print('type of self.gradInput:', self.gradInput:type())
+  --print(self.gradInput)
   return self.gradInput
 end
 
@@ -504,21 +523,31 @@ end
 
 function Gram:updateOutput(input)
   assert(input:dim() == 3)
-  local C, H, W = input:size(1), input:size(2), input:size(3)
-  local x_flat = input:view(C, H * W)
-  self.output:resize(C, C)
-  self.output:mm(x_flat, x_flat:t())
-  return self.output
+  local input_l = input:clone():cuda()
+  local C, H, W = input_l:size(1), input_l:size(2), input_l:size(3)
+  local x_flat = input_l:view(C, H * W):cuda()
+  self.output = self.output:resize(C, C):cuda()
+  self.output:mm(x_flat, x_flat:t()):cuda()
+  self.output:div(C*H*W):cuda() --move the normalization here
+  --print('The forward result of gram matrix')
+  --print(self.output)
+  return self.output:cudaHalf()
 end
 
 function Gram:updateGradInput(input, gradOutput)
   assert(input:dim() == 3 and input:size(1))
-  local C, H, W = input:size(1), input:size(2), input:size(3)
-  local x_flat = input:view(C, H * W)
-  self.gradInput:resize(C, H * W):mm(gradOutput, x_flat)
-  self.gradInput:addmm(gradOutput:t(), x_flat)
+  local input_l = input:clone():cuda()
+  local gradOutput_l = gradOutput:clone():cuda()
+  local C, H, W = input_l:size(1), input_l:size(2), input_l:size(3)
+  gradOutput_l = gradOutput_l:div(C*H*W):cuda() --move the normalization here
+  local x_flat = input_l:view(C, H * W):cuda()
+  self.gradInput = self.gradInput:resize(C, H * W):cuda()
+  self.gradInput:mm(gradOutput_l, x_flat):cuda()
+  self.gradInput:addmm(gradOutput_l:t(), x_flat):cuda()
   self.gradInput = self.gradInput:view(C, H, W)
-  return self.gradInput
+  --print('The backward result of gram matrix')
+  --print(self.gradInput)
+  return self.gradInput:cudaHalf()
 end
 
 
@@ -529,20 +558,20 @@ function StyleLoss:__init(strength, normalize)
   parent.__init(self)
   self.normalize = normalize or false
   self.strength = strength
-  --self.target = torch.Tensor()
-  self.target = torch.HalfTensor()
+  self.target = torch.CudaHalfTensor()
   self.mode = 'none'
   self.loss = 0
 
-  self.gram = nn.GramMatrix()
+  self.gram = nn.GramMatrix():cuda()
   self.blend_weight = nil
   self.G = nil
-  self.crit = nn.MSECriterion()
+  self.crit = nn.SELF_MSECriterion():cuda()
 end
 
 function StyleLoss:updateOutput(input)
   self.G = self.gram:forward(input)
-  self.G:div(input:nElement())
+  --already moved the normalization to the Gram class
+  --self.G:div(input:nElement())
   if self.mode == 'capture' then
     if self.blend_weight == nil then
       self.target:resizeAs(self.G):copy(self.G)
@@ -550,6 +579,7 @@ function StyleLoss:updateOutput(input)
       self.target:resizeAs(self.G):copy(self.G):mul(self.blend_weight)
     else
       self.target:add(self.blend_weight, self.G)
+      print('self.target:add(self.blend_weight, self.G)')
     end
   elseif self.mode == 'loss' then
     self.loss = self.strength * self.crit:forward(self.G, self.target)
@@ -560,17 +590,28 @@ end
 
 function StyleLoss:updateGradInput(input, gradOutput)
   if self.mode == 'loss' then
+    --local Gcuda = self.G:clone():cuda()
+    --print('type of self.G:',self.G:type())
+    --print('type of Gcuda:', Gcuda:type())
+    --local targetcuda = self.target:clone():cuda()
+    --print('type of self.target:', self.target:type())
+    --print('type of targetcuda:', targetcuda:type())
     local dG = self.crit:backward(self.G, self.target)
-    dG:div(input:nElement())
+    --already moved the normalization to the Gram class
+    --dG:div(input:nElement())
     self.gradInput = self.gram:backward(input, dG)
     if self.normalize then
       self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
     end
     self.gradInput:mul(self.strength)
+    -- print('gradInput type:', self.gradInput:type())
+    -- print('gradOutput type:', gradOutput:type())
     self.gradInput:add(gradOutput)
   else
     self.gradInput = gradOutput
   end
+  --print('The gradient of style layer:')
+  --print(self.gradInput)
   return self.gradInput
 end
 
@@ -580,10 +621,8 @@ local TVLoss, parent = torch.class('nn.TVLoss', 'nn.Module')
 function TVLoss:__init(strength)
   parent.__init(self)
   self.strength = strength
-  --self.x_diff = torch.Tensor()
-  --self.y_diff = torch.Tensor()
-  self.x_diff = torch.HalfTensor()
-  self.y_diff = torch.HalfTensor()
+  self.x_diff = torch.Tensor()
+  self.y_diff = torch.Tensor()
 end
 
 function TVLoss:updateOutput(input)
@@ -607,6 +646,47 @@ function TVLoss:updateGradInput(input, gradOutput)
   self.gradInput:mul(self.strength)
   self.gradInput:add(gradOutput)
   return self.gradInput
+end
+
+
+local SELF_MSECriterion, parent = torch.class('nn.SELF_MSECriterion', 'nn.Criterion')
+
+function SELF_MSECriterion:__init(sizeAverage)
+   self.gradInput = torch.CudaTensor()
+   self.output = 0   
+   if sizeAverage ~= nil then
+     self.sizeAverage = sizeAverage
+   else
+     self.sizeAverage = true
+   end
+end
+
+function SELF_MSECriterion:updateOutput(input, target)
+   self.output_tensor = self.output_tensor or input.new(1)
+   self.output_tensor = self.output_tensor:cuda()
+   local input_c = input:cuda();
+   local target_c = target:cuda();
+   input_c.THNN.MSECriterion_updateOutput(
+      input_c:cdata(),
+      target_c:cdata(),
+      self.output_tensor:cdata(),
+      self.sizeAverage
+   )
+   self.output = self.output_tensor[1]
+   return self.output 
+end
+
+function SELF_MSECriterion:updateGradInput(input, target)
+   local input_c = input:cuda();
+   local target_c = target:cuda();
+   input_c.THNN.MSECriterion_updateGradInput(
+      input_c:cdata(),
+      target_c:cdata(),
+      self.gradInput:cdata(),
+      self.sizeAverage
+   )
+   print('MSEcriterion gradInput dim:',self.gradInput:dim())
+   return self.gradInput -- in CudaTensor format
 end
 
 
